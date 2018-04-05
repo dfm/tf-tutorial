@@ -4,12 +4,16 @@ from __future__ import division, print_function
 
 __all__ = ["IdentityMetric", "IsotropicMetric", "DiagonalMetric",
            "DenseMetric",
-           "leapfrog", "step_hmc", "simple_hmc"]
+           "simple_hmc", "simple_nuts",
+           "tf_simple_hmc", "tf_simple_nuts",
+           "TFModel", ]
 
 from collections import namedtuple
 
 import numpy as np
 from scipy.linalg import cholesky, solve_triangular
+
+import tensorflow as tf
 
 try:
     from tqdm import tqdm
@@ -131,44 +135,21 @@ def simple_hmc(log_prob_fn, grad_log_prob_fn, q, niter, epsilon, L,
 
 def tf_simple_hmc(session, log_prob_tensor, var_list, niter, epsilon, L,
                   metric=None, feed_dict=None):
-    import tensorflow as tf
-
-    if feed_dict is None:
-        feed_dict = {}
-
-    grad_log_prob_tensor = tf.gradients(log_prob_tensor, var_list)
-
-    initial_vars = session.run(var_list)
-    sizes = [np.size(v) for v in initial_vars]
-    shapes = [np.shape(v) for v in initial_vars]
-    q = np.concatenate([np.reshape(v, s) for v, s in zip(initial_vars, sizes)])
-
-    def get_feed_dict(vector):
-        i = 0
-        fd = dict(feed_dict)
-        for var, size, shape in zip(var_list, sizes, shapes):
-            fd[var] = np.reshape(vector[i:i+size], shape)
-            i += size
-        return fd
-
-    def log_prob(params):
-        fd = get_feed_dict(params)
-        return session.run(log_prob_tensor, feed_dict=fd)
-
-    def grad_log_prob(params):
-        fd = get_feed_dict(params)
-        g = session.run(grad_log_prob_tensor, feed_dict=fd)
-        return np.concatenate([np.reshape(v, s) for v, s in zip(g, sizes)])
+    model = TFModel(log_prob_tensor, var_list, session=session,
+                    feed_dict=feed_dict)
+    model.setup()
+    q = model.current_vector()
 
     # Run the HMC
     samples, samples_lp, acc_frac = simple_hmc(
-        log_prob, grad_log_prob, q, niter, epsilon, L,
+        model.value, model.gradient, q, niter, epsilon, L,
         metric=metric
     )
 
     # Update the variables
-    fd = get_feed_dict(samples[-1])
-    session.run([tf.assign(v, fd[v]) for v in var_list], **feed_dict)
+    fd = model.vector_to_feed_dict(samples[-1])
+    feed = {} if feed_dict is None else feed_dict
+    session.run([tf.assign(v, fd[v]) for v in var_list], **feed)
 
     return samples, samples_lp, acc_frac
 
@@ -360,43 +341,74 @@ def simple_nuts(log_prob_fn, grad_log_prob_fn, q, niter, epsilon,
 def tf_simple_nuts(session, log_prob_tensor, var_list, niter, epsilon,
                    metric=None, max_depth=5, max_delta_h=1000.0,
                    feed_dict=None):
-    import tensorflow as tf
-
-    if feed_dict is None:
-        feed_dict = {}
-
-    grad_log_prob_tensor = tf.gradients(log_prob_tensor, var_list)
-
-    initial_vars = session.run(var_list)
-    sizes = [np.size(v) for v in initial_vars]
-    shapes = [np.shape(v) for v in initial_vars]
-    q = np.concatenate([np.reshape(v, s) for v, s in zip(initial_vars, sizes)])
-
-    def get_feed_dict(vector):
-        i = 0
-        fd = dict(feed_dict)
-        for var, size, shape in zip(var_list, sizes, shapes):
-            fd[var] = np.reshape(vector[i:i+size], shape)
-            i += size
-        return fd
-
-    def log_prob(params):
-        fd = get_feed_dict(params)
-        return session.run(log_prob_tensor, feed_dict=fd)
-
-    def grad_log_prob(params):
-        fd = get_feed_dict(params)
-        g = session.run(grad_log_prob_tensor, feed_dict=fd)
-        return np.concatenate([np.reshape(v, s) for v, s in zip(g, sizes)])
+    model = TFModel(log_prob_tensor, var_list, session=session,
+                    feed_dict=feed_dict)
+    model.setup()
+    q = model.current_vector()
 
     # Run the HMC
     samples, samples_lp, acc_frac = simple_nuts(
-        log_prob, grad_log_prob, q, niter, epsilon,
+        model.value, model.gradient, q, niter, epsilon,
         metric=metric, max_depth=max_depth, max_delta_h=max_delta_h,
     )
 
     # Update the variables
-    fd = get_feed_dict(samples[-1])
-    session.run([tf.assign(v, fd[v]) for v in var_list], **feed_dict)
+    fd = model.vector_to_feed_dict(samples[-1])
+    feed = {} if feed_dict is None else feed_dict
+    session.run([tf.assign(v, fd[v]) for v in var_list], **feed)
 
     return samples, samples_lp, acc_frac
+
+
+class TFModel(object):
+
+    def __init__(self, target, var_list, feed_dict=None, session=None):
+        self.target = target
+        self.var_list = var_list
+        self.grad_target = tf.gradients(self.target, self.var_list)
+        self.feed_dict = {} if feed_dict is None else feed_dict
+        self._session = session
+
+    @property
+    def session(self):
+        if self._session is None:
+            return tf.get_default_session()
+        return self._session
+
+    def value(self, vector):
+        feed_dict = self.vector_to_feed_dict(vector)
+        return self.session.run(self.target, feed_dict=feed_dict)
+
+    def gradient(self, vector):
+        feed_dict = self.vector_to_feed_dict(vector)
+        return np.concatenate([
+            np.reshape(g, s) for s, g in zip(
+                self.sizes,
+                self.session.run(self.grad_target, feed_dict=feed_dict))
+        ])
+
+    def setup(self, session=None):
+        if session is not None:
+            self._session = session
+        values = self.session.run(self.var_list)
+        self.sizes = [np.size(v) for v in values]
+        self.shapes = [np.shape(v) for v in values]
+
+    def vector_to_feed_dict(self, vector):
+        i = 0
+        fd = dict(self.feed_dict)
+        for var, size, shape in zip(self.var_list, self.sizes, self.shapes):
+            fd[var] = np.reshape(vector[i:i+size], shape)
+            i += size
+        return fd
+
+    def feed_dict_to_vector(self, feed_dict):
+        return np.concatenate([
+            np.reshape(feed_dict[v], s)
+            for v, s in zip(self.var_list, self.sizes)])
+
+    def current_vector(self):
+        values = self.session.run(self.var_list)
+        return np.concatenate([
+            np.reshape(v, s)
+            for v, s in zip(values, self.sizes)])
