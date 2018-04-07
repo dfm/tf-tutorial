@@ -149,7 +149,7 @@ def tf_simple_hmc(session, log_prob_tensor, var_list, niter, epsilon, L,
     # Update the variables
     fd = model.vector_to_feed_dict(samples[-1])
     feed = {} if feed_dict is None else feed_dict
-    session.run([tf.assign(v, fd[v]) for v in var_list], **feed)
+    session.run([tf.assign(v, fd[v]) for v in var_list], feed_dict=feed)
 
     return samples, samples_lp, acc_frac
 
@@ -355,7 +355,7 @@ def tf_simple_nuts(session, log_prob_tensor, var_list, niter, epsilon,
     # Update the variables
     fd = model.vector_to_feed_dict(samples[-1])
     feed = {} if feed_dict is None else feed_dict
-    session.run([tf.assign(v, fd[v]) for v in var_list], **feed)
+    session.run([tf.assign(v, fd[v]) for v in var_list], feed_dict=feed)
 
     return samples, samples_lp, acc_frac
 
