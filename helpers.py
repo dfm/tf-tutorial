@@ -19,7 +19,7 @@ try:
     from tqdm import tqdm
 except ImportError:
     def tqdm(*args, **kwargs):
-        return args
+        return args[0]
 
 
 class IdentityMetric(object):
